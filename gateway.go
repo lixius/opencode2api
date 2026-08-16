@@ -331,6 +331,16 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		if node == nil {
 			break
 		}
+		// Track upstream usage per key fingerprint (never the raw key) so the
+		// dashboard can break down traffic by key. Retries count too because
+		// every attempt consumes upstream quota.
+		if meta, _ := ctx.Value(requestMetaKey{}).(*requestMeta); meta != nil {
+			keyID := string(route.Tier) + ":" + secretFingerprint(node.key)
+			if meta.Keys == nil {
+				meta.Keys = make(map[string]int)
+			}
+			meta.Keys[keyID]++
+		}
 		if lastResponse != nil {
 			drainAndClose(lastResponse.Body)
 			lastResponse = nil

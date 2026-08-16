@@ -293,6 +293,10 @@ type requestMeta struct {
 	Request  string
 	Attempts int
 	Stream   bool
+	// Keys counts upstream attempts per "tier:key-fingerprint". Only
+	// fingerprints are stored (never credentials) and retries are counted
+	// because every attempt consumes upstream quota.
+	Keys map[string]int
 }
 
 type requestMetaKey struct{}
@@ -313,12 +317,13 @@ type metricBucket struct {
 	models    map[string]uint64
 	tiers     map[string]uint64
 	statuses  map[string]uint64
+	keys      map[string]uint64
 }
 
 func (b *metricBucket) reset(minute int64) {
 	*b = metricBucket{
 		minute: minute, endpoints: make(map[string]uint64), models: make(map[string]uint64),
-		tiers: make(map[string]uint64), statuses: make(map[string]uint64),
+		tiers: make(map[string]uint64), statuses: make(map[string]uint64), keys: make(map[string]uint64),
 	}
 }
 
@@ -375,6 +380,9 @@ func (m *Monitor) Record(endpoint string, status int, duration time.Duration, me
 		if meta.Tier != "" {
 			bucket.tiers[meta.Tier]++
 		}
+		for keyID, count := range meta.Keys {
+			bucket.keys[keyID] += uint64(count)
+		}
 	}
 	m.mu.Unlock()
 }
@@ -391,6 +399,7 @@ type MonitorSnapshot struct {
 	Models        map[string]uint64 `json:"models"`
 	Tiers         map[string]uint64 `json:"tiers"`
 	Statuses      map[string]uint64 `json:"statuses"`
+	Keys          map[string]uint64 `json:"keys"`
 }
 
 type MetricSummary struct {
@@ -415,7 +424,7 @@ func (m *Monitor) Snapshot() MonitorSnapshot {
 	nowMinute := time.Now().Unix() / 60
 	window := MetricSummary{}
 	var histogram [11]uint64
-	endpoints, models, tiers, statuses := map[string]uint64{}, map[string]uint64{}, map[string]uint64{}, map[string]uint64{}
+	endpoints, models, tiers, statuses, keys := map[string]uint64{}, map[string]uint64{}, map[string]uint64{}, map[string]uint64{}, map[string]uint64{}
 	series := make([]MetricSeries, 0, 60)
 	m.mu.Lock()
 	for offset := int64(59); offset >= 0; offset-- {
@@ -435,6 +444,7 @@ func (m *Monitor) Snapshot() MonitorSnapshot {
 			mergeCounts(models, bucket.models)
 			mergeCounts(tiers, bucket.tiers)
 			mergeCounts(statuses, bucket.statuses)
+			mergeCounts(keys, bucket.keys)
 		}
 		series = append(series, entry)
 	}
@@ -453,7 +463,7 @@ func (m *Monitor) Snapshot() MonitorSnapshot {
 	return MonitorSnapshot{
 		StartedAt: m.started, UptimeSeconds: int64(time.Since(m.started).Seconds()), Active: m.active.Load(),
 		ActiveStreams: m.activeStreams.Load(), Lifetime: lifetime, Window: window, Series: series,
-		Endpoints: endpoints, Models: models, Tiers: tiers, Statuses: statuses,
+		Endpoints: endpoints, Models: models, Tiers: tiers, Statuses: statuses, Keys: keys,
 	}
 }
 
