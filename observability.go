@@ -521,6 +521,15 @@ func monitorMiddleware(monitor *Monitor, logger *slog.Logger, next http.Handler)
 				status = http.StatusOK
 			}
 			duration := time.Since(started)
+			// Health checks are infrastructure noise: keep the log (at debug level)
+			// but exclude them from request statistics so the dashboard only
+			// reflects real API traffic.
+			if r.URL.Path == "/healthz" {
+				logger.Debug("request completed", "component", "http", "event", "request_complete", "method", r.Method,
+					"path", r.URL.Path, "status", status, "duration_ms", duration.Milliseconds(), "bytes", writer.bytes,
+					"request_id", meta.Request, "model", meta.Model, "tier", meta.Tier, "attempts", meta.Attempts, "stream", meta.Stream)
+				return
+			}
 			monitor.Record(r.URL.Path, status, duration, meta)
 			logger.Info("request completed", "component", "http", "event", "request_complete", "method", r.Method,
 				"path", r.URL.Path, "status", status, "duration_ms", duration.Milliseconds(), "bytes", writer.bytes,

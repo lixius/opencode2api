@@ -6,3 +6,5 @@ opencode2api.exe
 *.log
 .tmp/
 .gocache/
+config.json.bak
+proxies.txt
