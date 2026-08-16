@@ -331,16 +331,6 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		if node == nil {
 			break
 		}
-		// Track upstream usage per key fingerprint (never the raw key) so the
-		// dashboard can break down traffic by key. Retries count too because
-		// every attempt consumes upstream quota.
-		if meta, _ := ctx.Value(requestMetaKey{}).(*requestMeta); meta != nil {
-			keyID := string(route.Tier) + ":" + secretFingerprint(node.key)
-			if meta.Keys == nil {
-				meta.Keys = make(map[string]int)
-			}
-			meta.Keys[keyID]++
-		}
 		if lastResponse != nil {
 			drainAndClose(lastResponse.Body)
 			lastResponse = nil
@@ -354,6 +344,21 @@ func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte,
 		if proxy == nil {
 			lastErr = errors.New("upstream key has no proxy binding")
 			break
+		}
+		// Track upstream usage per key fingerprint (never the raw key) and per
+		// proxy exit, so the dashboard can break down traffic by key and IP.
+		// Retries count too because every attempt consumes upstream quota.
+		if meta, _ := ctx.Value(requestMetaKey{}).(*requestMeta); meta != nil {
+			keyID := string(route.Tier) + ":" + secretFingerprint(node.key)
+			if meta.Keys == nil {
+				meta.Keys = make(map[string]map[string]int)
+			}
+			proxies := meta.Keys[keyID]
+			if proxies == nil {
+				proxies = make(map[string]int)
+				meta.Keys[keyID] = proxies
+			}
+			proxies[redactURL(proxy.name)]++
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json, text/event-stream")
