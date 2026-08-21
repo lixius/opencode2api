@@ -7,3 +7,8 @@ opencode2api.exe
 *.log
 .tmp/
 .gocache/
+
+# docker compose port overrides (no secrets)
+.env
+config.json.bak
+proxies.txt
