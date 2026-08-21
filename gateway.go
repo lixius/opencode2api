@@ -295,7 +295,7 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 			var usageReported bool
 			if external == route.Protocol {
 				observer := newStreamUsageObserver(route.Protocol)
-				_, err = io.Copy(w, io.TeeReader(resp.Body, observer))
+				_, err = io.Copy(flushOnWriteWriter{w: w, flusher: w.(http.Flusher)}, io.TeeReader(resp.Body, observer))
 				usage = observer.Finish()
 				usageReported = observer.Reported()
 			} else {
@@ -329,6 +329,24 @@ func (g *Gateway) handleInference(external Protocol) http.HandlerFunc {
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(responseBody)
 	}
+}
+
+// flushOnWriteWriter forwards writes to the response and flushes after each
+// one so server-sent event streams are delivered incrementally instead of
+// being held in the http.ResponseWriter buffer until it fills (about 4KB) or
+// the handler returns. Without this, a same-protocol passthrough stream
+// arrives at the client in large lumps rather than as tokens are produced.
+type flushOnWriteWriter struct {
+	w       http.ResponseWriter
+	flusher http.Flusher
+}
+
+func (f flushOnWriteWriter) Write(p []byte) (int, error) {
+	n, err := f.w.Write(p)
+	if f.flusher != nil {
+		f.flusher.Flush()
+	}
+	return n, err
 }
 
 func (g *Gateway) doUpstream(ctx context.Context, route modelRoute, body []byte, ids requestIDs) (*http.Response, error) {

@@ -1,7 +1,7 @@
 services:
   opencode2api:
-    image: ghcr.io/jasonxu114514/opencode2api:${OPENCODE2API_VERSION:-latest}
-    pull_policy: always
+    image: ${OPENCODE2API_IMAGE:-ghcr.io/jasonxu114514/opencode2api:latest}
+    pull_policy: ${OPENCODE2API_PULL:-always}
     restart: unless-stopped
     read_only: true
     security_opt:
