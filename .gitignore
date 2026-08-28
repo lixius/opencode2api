@@ -8,7 +8,8 @@ opencode2api.exe
 .tmp/
 .gocache/
 
-# docker compose port overrides (no secrets)
+# local deployment state (no secrets should ever be committed)
 .env
 config.json.bak
 proxies.txt
+.deploy-backup-*/
