@@ -117,6 +117,14 @@ func NormalizeConfig(path string, cfg Config) (Config, error) {
 	if cfg.Listen == "" {
 		return Config{}, errors.New("listen must not be empty")
 	}
+	cfg.Upstream.Zen = strings.TrimSpace(cfg.Upstream.Zen)
+	cfg.Upstream.Go = strings.TrimSpace(cfg.Upstream.Go)
+	for name, raw := range map[string]string{"upstream.zen": cfg.Upstream.Zen, "upstream.go": cfg.Upstream.Go} {
+		u, err := url.Parse(strings.TrimSpace(raw))
+		if err != nil || u.Host == "" || (strings.ToLower(u.Scheme) != "http" && strings.ToLower(u.Scheme) != "https") {
+			return Config{}, fmt.Errorf("%s must be an http or https URL", name)
+		}
+	}
 	if len(cfg.ServerKeys) == 0 {
 		return Config{}, errors.New("server_keys must contain at least one local key")
 	}

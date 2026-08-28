@@ -52,6 +52,21 @@ func NewRuntimeManager(root context.Context, configPath string, cfg Config, logg
 		effective: effectiveListeners{API: cfg.Listen, WebUI: cfg.WebUI.Listen, WebUIEnabled: cfg.WebUI.Enabled},
 	}
 	manager.metadata = newModelMetadataStore(configPath, logger)
+	// models.dev refreshes ride the active runtime's healthy proxy transports
+	// and fall back to the store's direct client when none are available.
+	manager.metadata.SetClientProvider(func() []*http.Client {
+		runtime := manager.current.Load()
+		if runtime == nil || runtime.gateway == nil || runtime.gateway.transports == nil {
+			return nil
+		}
+		clients := make([]*http.Client, 0, len(runtime.gateway.transports.items))
+		for _, proxy := range runtime.gateway.transports.items {
+			if proxy != nil && proxy.healthy.Load() {
+				clients = append(clients, proxy.client)
+			}
+		}
+		return clients
+	})
 	if cfg.WebUI.Password != "" {
 		hash, err := hashPassword(cfg.WebUI.Password)
 		if err != nil {
@@ -290,9 +305,6 @@ func (m *RuntimeManager) DebugModels() ([]ModelRouteDiagnostic, MetadataSnapshot
 	models := gateway.catalog.List()
 	result := make([]ModelRouteDiagnostic, 0, len(models))
 	for _, model := range models {
-		if !supportedModel(model) {
-			continue
-		}
 		result = append(result, gateway.catalog.Diagnostic(model, "", len(gateway.cfg.ZenKeys) > 0, len(gateway.cfg.GoKeys) > 0, gateway.cfg.Anonymous))
 	}
 	metadata := MetadataSnapshot{}
@@ -314,7 +326,7 @@ func (m *RuntimeManager) DebugRoute(model string, requested Protocol) ModelRoute
 func keyStatuses(tier string, pool *nodePool) []KeyStatus {
 	result := make([]KeyStatus, 0, len(pool.nodes))
 	for _, node := range pool.nodes {
-		status := KeyStatus{ID: secretFingerprint(node.key), Tier: tier, Index: node.index, ProxyIndex: int(node.proxyIndex.Load()), Failures: node.failures.Load()}
+		status := KeyStatus{ID: keyDisplayID(node.key), Tier: tier, Index: node.index, ProxyIndex: int(node.proxyIndex.Load()), Failures: node.failures.Load()}
 		if until := node.cooldownUntil.Load(); until > time.Now().UnixNano() {
 			value := time.Unix(0, until).UTC()
 			status.CooldownUntil = &value
@@ -327,4 +339,15 @@ func keyStatuses(tier string, pool *nodePool) []KeyStatus {
 func secretFingerprint(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])[:10]
+}
+
+// keyDisplayID is intentionally separate from secretFingerprint. The latter
+// is an internal stable identifier used by session/config bookkeeping; this
+// value is safe for logs and the operator UI and shows only the key suffix.
+func keyDisplayID(value string) string {
+	runes := []rune(value)
+	if len(runes) <= 5 {
+		return string(runes)
+	}
+	return string(runes[len(runes)-5:])
 }

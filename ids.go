@@ -12,14 +12,17 @@ import (
 )
 
 type requestIDs struct {
-	Session string
-	Request string
-	Project string
+	Session       string
+	Request       string
+	Project       string
+	ParentSession string
 }
 
 func deriveRequestIDs(r *http.Request, body map[string]any) requestIDs {
 	signal := firstString(
 		r.Header.Get("x-opencode-session"),
+		r.Header.Get("x-session-affinity"),
+		r.Header.Get("X-Session-Id"),
 		r.Header.Get("x-session-id"),
 		r.Header.Get("conversation-id"),
 		stringAt(body, "conversation_id"),
@@ -41,10 +44,15 @@ func deriveRequestIDs(r *http.Request, body map[string]any) requestIDs {
 	if projectSignal == "" {
 		projectSignal = "opencode2api:default-project"
 	}
+	parentSession := firstString(
+		r.Header.Get("x-parent-session-id"),
+		stringAt(body, "metadata", "parent_session_id"),
+	)
 	return requestIDs{
-		Session: session,
-		Request: randomID("req", 16),
-		Project: stableID("prj", projectSignal),
+		Session:       session,
+		Request:       randomID("req", 16),
+		Project:       stableID("prj", projectSignal),
+		ParentSession: parentSession,
 	}
 }
 
@@ -90,5 +98,5 @@ func firstString(values ...string) string {
 }
 
 func opencodeUserAgent() string {
-	return fmt.Sprintf("opencode/1.18.18 (%s %s; %s)", runtime.GOOS, runtime.GOARCH, runtime.Version())
+	return fmt.Sprintf("opencode/1.18.21 (%s %s; %s)", runtime.GOOS, runtime.GOARCH, runtime.Version())
 }

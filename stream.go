@@ -4,12 +4,15 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
 )
+
+var errStreamUpstreamFailure = errors.New("upstream stream failure delivered")
 
 type bridgeStreamEvent struct {
 	Kind       string
@@ -21,6 +24,9 @@ type bridgeStreamEvent struct {
 	ToolID     string
 	ToolName   string
 	Stop       string
+	Error      string
+	ErrorType  string
+	Encrypted  string
 	Usage      *bridgeUsage
 }
 
@@ -57,7 +63,7 @@ func transcodeStreamWithUsage(w http.ResponseWriter, reader io.Reader, from, to 
 	if err := readSSE(reader, func(eventName, data string) error {
 		events, err := parser.Parse(eventName, data)
 		if err != nil {
-			return err
+			return emitter.Emit(bridgeStreamEvent{Kind: "error", Error: err.Error(), ErrorType: "upstream_error"})
 		}
 		for _, event := range events {
 			if err := emitter.Emit(event); err != nil {
@@ -66,6 +72,9 @@ func transcodeStreamWithUsage(w http.ResponseWriter, reader io.Reader, from, to 
 		}
 		return nil
 	}); err != nil {
+		if errors.Is(err, errStreamUpstreamFailure) {
+			return emitter.usage, emitter.usageReported, nil
+		}
 		return emitter.usage, emitter.usageReported, err
 	}
 	return emitter.usage, emitter.usageReported, emitter.Finish()
@@ -215,7 +224,7 @@ func (parser *bridgeStreamParser) parseChat(value map[string]any) []bridgeStream
 	for _, raw := range sliceAt(value, "choices") {
 		choice, _ := raw.(map[string]any)
 		delta := mapAt(choice, "delta")
-		if reasoning := stringAt(delta, "reasoning_content"); reasoning != "" {
+		if reasoning := firstString(stringAt(delta, "reasoning_content"), stringAt(delta, "reasoning")); reasoning != "" {
 			events = append(events, bridgeStreamEvent{Kind: "reasoning", Text: reasoning})
 		}
 		if text := stringAt(delta, "content"); text != "" {
@@ -245,6 +254,10 @@ func (parser *bridgeStreamParser) parseChat(value map[string]any) []bridgeStream
 			}
 		}
 		if stop := stringAt(choice, "finish_reason"); stop != "" {
+			if isStreamErrorFinish(stop) {
+				events = append(events, bridgeStreamEvent{Kind: "error", Error: firstString(stringAt(choice, "error", "message"), "upstream Chat stream failed"), ErrorType: "upstream_error"})
+				continue
+			}
 			for _, key := range parser.toolOrder {
 				if !parser.tools[key] && parser.toolNames[key] != "" {
 					parser.tools[key] = true
@@ -280,6 +293,8 @@ func (parser *bridgeStreamParser) parseAnthropic(value map[string]any) ([]bridge
 				events = append(events, bridgeStreamEvent{Kind: "reasoning_signature", Signature: signature})
 			}
 			return events, nil
+		case "redacted_thinking":
+			return []bridgeStreamEvent{{Kind: "reasoning", Encrypted: stringAt(block, "data")}}, nil
 		case "tool_use":
 			parser.tools[key] = true
 			return []bridgeStreamEvent{{Kind: "tool_start", ToolKey: key, ToolID: stringAt(block, "id"), ToolName: stringAt(block, "name")}}, nil
@@ -315,7 +330,7 @@ func (parser *bridgeStreamParser) parseAnthropic(value map[string]any) ([]bridge
 		return []bridgeStreamEvent{{Kind: "done"}}, nil
 	case "error":
 		message := firstString(stringAt(value, "error", "message"), "upstream Anthropic stream error")
-		return nil, fmt.Errorf("%s", message)
+		return []bridgeStreamEvent{{Kind: "error", Error: message, ErrorType: firstString(stringAt(value, "error", "type"), "upstream_error")}}, nil
 	}
 	return nil, nil
 }
@@ -364,7 +379,7 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 			}
 			blocks := decodeResponsesReasoning(item)
 			if len(blocks) > 0 {
-				return []bridgeStreamEvent{{Kind: "reasoning", Text: blocks[0].Text}}
+				return []bridgeStreamEvent{{Kind: "reasoning", Text: blocks[0].Text, Encrypted: blocks[0].Encrypted}}
 			}
 			return nil
 		}
@@ -386,15 +401,26 @@ func (parser *bridgeStreamParser) parseResponses(eventName string, value map[str
 	case "response.completed", "response.incomplete", "response.failed", "response.done":
 		response := mapAt(value, "response")
 		usage := decodeOpenAIUsage(mapAt(response, "usage"))
+		if typeName == "response.failed" || stringAt(response, "status") == "failed" {
+			message := firstString(stringAt(response, "error", "message"), stringAt(value, "error", "message"), "upstream Responses request failed")
+			return []bridgeStreamEvent{{Kind: "usage", Usage: &usage}, {Kind: "error", Error: message, ErrorType: firstString(stringAt(response, "error", "code"), "upstream_error")}}
+		}
 		stop := "stop"
 		if typeName == "response.incomplete" {
 			stop = canonicalResponsesIncomplete(stringAt(response, "incomplete_details", "reason"))
-		} else if typeName == "response.failed" {
-			stop = "error"
 		}
 		return []bridgeStreamEvent{{Kind: "usage", Usage: &usage}, {Kind: "finish", Stop: stop}, {Kind: "done"}}
 	}
 	return nil
+}
+
+func isStreamErrorFinish(stop string) bool {
+	switch strings.ToLower(strings.TrimSpace(stop)) {
+	case "error", "network_error", "server_error":
+		return true
+	default:
+		return false
+	}
 }
 
 func (parser *bridgeStreamParser) rememberTool(key, id, name string) {
@@ -456,6 +482,7 @@ type bridgeStreamEmitter struct {
 	stop               string
 	usage              bridgeUsage
 	usageReported      bool
+	reasoningEncrypted string
 	text               strings.Builder
 	reasoning          strings.Builder
 	reasoningSignature strings.Builder
@@ -503,6 +530,15 @@ func (emitter *bridgeStreamEmitter) Emit(event bridgeStreamEvent) error {
 	}
 	switch event.Kind {
 	case "reasoning":
+		if event.Encrypted != "" {
+			emitter.reasoningEncrypted = event.Encrypted
+			if emitter.target != ProtocolResponses && event.Text == "" {
+				event.Text = anthropicRedactedThinkingPlaceholder
+			}
+			if emitter.target == ProtocolResponses && event.Text == "" {
+				return emitter.startReasoning()
+			}
+		}
 		if event.Text == "" {
 			return nil
 		}
@@ -552,10 +588,44 @@ func (emitter *bridgeStreamEmitter) Emit(event bridgeStreamEvent) error {
 		}
 	case "finish":
 		emitter.stop = event.Stop
+	case "error":
+		emitter.done = true
+		if err := emitter.emitError(firstString(event.Error, "upstream stream failed"), firstString(event.ErrorType, "upstream_error")); err != nil {
+			return err
+		}
+		return errStreamUpstreamFailure
 	case "done":
 		return emitter.Finish()
 	}
 	return nil
+}
+
+func (emitter *bridgeStreamEmitter) emitError(message, errorType string) error {
+	switch emitter.target {
+	case ProtocolAnthropic:
+		return emitter.sse("error", map[string]any{
+			"type":  "error",
+			"error": map[string]any{"type": errorType, "message": message},
+		})
+	case ProtocolResponses:
+		response := emitter.responsesBase("failed", []any{})
+		response["error"] = map[string]any{"code": errorType, "message": message}
+		return emitter.sse("response.failed", map[string]any{
+			"type":            "response.failed",
+			"response":        response,
+			"sequence_number": emitter.nextSequence(),
+		})
+	default:
+		if err := emitter.sse("", map[string]any{"error": map[string]any{
+			"message": message,
+			"type":    errorType,
+			"param":   nil,
+			"code":    nil,
+		}}); err != nil {
+			return err
+		}
+		return emitter.rawSSE("", "[DONE]")
+	}
 }
 
 func (emitter *bridgeStreamEmitter) tool(key string) *bridgeStreamTool {
@@ -608,7 +678,7 @@ func (emitter *bridgeStreamEmitter) start() error {
 				"content":       []any{},
 				"stop_reason":   nil,
 				"stop_sequence": nil,
-				"usage":         map[string]any{"input_tokens": 0, "output_tokens": 0},
+				"usage":         anthropicUsage(bridgeUsage{}),
 			},
 		})
 	case ProtocolResponses:
@@ -751,6 +821,9 @@ func (emitter *bridgeStreamEmitter) finishReasoning() error {
 			return err
 		}
 		item := map[string]any{"id": emitter.reasoningItemID, "type": "reasoning", "status": "completed", "summary": []any{part}}
+		if emitter.reasoningEncrypted != "" {
+			item["encrypted_content"] = emitter.reasoningEncrypted
+		}
 		return emitter.sse("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": emitter.reasoningOutput, "item": item, "sequence_number": emitter.nextSequence()})
 	}
 	return nil
@@ -890,7 +963,7 @@ func (emitter *bridgeStreamEmitter) Finish() error {
 		if err := emitter.sse("message_delta", map[string]any{
 			"type":  "message_delta",
 			"delta": map[string]any{"stop_reason": anthropicStop(emitter.stop), "stop_sequence": nil},
-			"usage": map[string]any{"input_tokens": emitter.usage.Input, "output_tokens": emitter.usage.Output},
+			"usage": anthropicUsage(emitter.usage),
 		}); err != nil {
 			return err
 		}
@@ -1025,6 +1098,9 @@ func mergeBridgeUsage(destination *bridgeUsage, source bridgeUsage) {
 	}
 	if source.Cached != 0 {
 		destination.Cached = source.Cached
+	}
+	if source.CacheCreation != 0 {
+		destination.CacheCreation = source.CacheCreation
 	}
 	if source.Reasoning != 0 {
 		destination.Reasoning = source.Reasoning

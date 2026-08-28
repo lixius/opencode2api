@@ -105,6 +105,8 @@ func (a *AdminServer) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -151,7 +153,7 @@ func (a *AdminServer) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	a.sessions[tokenDigest(token)] = adminSession{Username: cfg.WebUI.Username, AuthVersion: secretFingerprint(cfg.WebUI.PasswordHash), CSRF: csrf, Expires: expires}
 	a.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: adminCookieName, Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: int(time.Until(expires).Seconds()), Secure: false})
+	http.SetCookie(w, &http.Cookie{Name: adminCookieName, Value: token, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Expires: expires, MaxAge: int(time.Until(expires).Seconds()), Secure: requestIsSecure(r)})
 	w.Header().Set("Cache-Control", "no-store")
 	a.logger.Info("admin login succeeded", "component", "auth", "event", "login_succeeded", "client_ip", client)
 	writeJSON(w, http.StatusOK, map[string]any{"username": cfg.WebUI.Username, "csrf_token": csrf, "expires_at": expires.UTC()})
@@ -170,7 +172,7 @@ func (a *AdminServer) handleLogout(w http.ResponseWriter, r *http.Request) {
 		delete(a.sessions, tokenDigest(cookie.Value))
 		a.mu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: adminCookieName, Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: -1})
+	http.SetCookie(w, &http.Cookie{Name: adminCookieName, Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: -1, Secure: requestIsSecure(r)})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -219,7 +221,11 @@ func (a *AdminServer) csrf(next http.Handler) http.Handler {
 		}
 		if origin := r.Header.Get("Origin"); origin != "" {
 			parsed, err := url.Parse(origin)
-			if err != nil || !strings.EqualFold(parsed.Host, r.Host) {
+			expectedScheme := "http"
+			if requestIsSecure(r) {
+				expectedScheme = "https"
+			}
+			if err != nil || !strings.EqualFold(parsed.Host, r.Host) || !strings.EqualFold(parsed.Scheme, expectedScheme) {
 				writeAdminError(w, http.StatusForbidden, "origin_failed", "request origin does not match this server")
 				return
 			}
@@ -388,7 +394,7 @@ func (a *AdminServer) handleAccount(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	a.sessions = make(map[string]adminSession)
 	a.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: adminCookieName, Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: -1})
+	http.SetCookie(w, &http.Cookie{Name: adminCookieName, Value: "", Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: -1, Secure: requestIsSecure(r)})
 	a.logger.Info("admin account updated", "component", "auth", "event", "account_updated", "client_ip", clientIP(r))
 	writeJSON(w, http.StatusOK, map[string]any{"updated": true, "reauthenticate": true})
 }
@@ -474,12 +480,28 @@ func (a *AdminServer) handleDebugInference(w http.ResponseWriter, r *http.Reques
 	duration := time.Since(started)
 	requestID := recorder.Header().Get("x-request-id")
 	if requestID != "" {
-		upstream := a.monitor.Snapshot().Upstream.Recent
-		for index := len(upstream) - 1; index >= 0; index-- {
-			if upstream[index].RequestID == requestID {
-				route.Anonymous = upstream[index].Anonymous
-				route.Tier = Tier(upstream[index].Tier)
+		snapshot := a.monitor.Snapshot().Upstream
+		for index := len(snapshot.Requests) - 1; index >= 0; index-- {
+			if snapshot.Requests[index].RequestID == requestID {
+				requestRoute := snapshot.Requests[index]
+				route.Anonymous = requestRoute.Anonymous
+				route.Tier = Tier(requestRoute.Tier)
+				route.KeyID = requestRoute.KeyID
+				route.Channel = requestRoute.Channel
+				route.Attempts = requestRoute.Attempts
 				break
+			}
+		}
+		if route.KeyID == "" {
+			for index := len(snapshot.Recent) - 1; index >= 0; index-- {
+				if snapshot.Recent[index].RequestID == requestID {
+					attempt := snapshot.Recent[index]
+					route.Anonymous = attempt.Anonymous
+					route.Tier = Tier(attempt.Tier)
+					route.KeyID = attempt.KeyID
+					route.Channel = attempt.Channel
+					break
+				}
 			}
 		}
 	}
@@ -528,7 +550,7 @@ func sanitizeDebugValue(value any, redactor *SecretRedactor) any {
 		result := make(map[string]any, len(current))
 		for key, item := range current {
 			lower := strings.ToLower(key)
-			if strings.Contains(lower, "authorization") || strings.Contains(lower, "cookie") || strings.Contains(lower, "password") || strings.Contains(lower, "secret") || strings.Contains(lower, "api_key") || strings.Contains(lower, "api-key") {
+			if sensitiveDebugKey(lower) {
 				result[key] = "***"
 				continue
 			}
@@ -649,10 +671,10 @@ func maskSecrets(values []string, proxy bool) []SecretView {
 
 func maskValue(value string) string {
 	runes := []rune(value)
-	if len(runes) <= 4 {
+	if len(runes) <= 5 {
 		return "••••"
 	}
-	return "••••" + string(runes[len(runes)-4:])
+	return "••••" + string(runes[len(runes)-5:])
 }
 
 func resolveSecrets(inputs []SecretInput, existing []string) ([]string, error) {
@@ -774,6 +796,25 @@ func clientIP(r *http.Request) string {
 		return host
 	}
 	return r.RemoteAddr
+}
+
+func requestIsSecure(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	return r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+}
+
+func sensitiveDebugKey(key string) bool {
+	for _, hint := range []string{
+		"authorization", "cookie", "password", "secret", "api_key", "api-key", "x-api-key",
+		"access_token", "refresh_token", "set-cookie", "credential",
+	} {
+		if strings.Contains(key, hint) {
+			return true
+		}
+	}
+	return false
 }
 
 func decodeAdminJSON(w http.ResponseWriter, r *http.Request, target any) error {
