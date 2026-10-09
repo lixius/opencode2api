@@ -19,3 +19,11 @@ coverage.out
 .env
 proxies.txt
 .deploy-backup-*/
+
+# upstream additions
+*.rotation.json
+.rotation-*.tmp
+
+# Local credentials, deployment backups, and verification artifacts
+.local/
+*.availability.json
